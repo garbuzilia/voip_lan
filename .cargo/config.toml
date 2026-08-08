@@ -1,0 +1,6 @@
+# Статическая линковка CRT для сборки под Windows (MSVC-таргет).
+# Благодаря этому итоговый .exe не требует установленного
+# Visual C++ Redistributable на компьютере пользователя.
+# На Linux/macOS эта секция просто игнорируется.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
