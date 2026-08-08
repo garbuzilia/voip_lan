@@ -1,0 +1,13 @@
+[package]
+name = "voip_lan"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+
+[dependencies]
+cpal = "0.15"   # захват/воспроизведение звука
+opus = "0.3"    # тот же кодек голоса, что использует Mumble
