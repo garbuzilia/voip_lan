@@ -28,8 +28,11 @@ jobs:
       - name: Сборка релиза
         run: cargo build --release
         env:
-          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
           RUSTFLAGS: "-C target-feature=+crt-static"
+          # libopus собирается из исходников через CMake (audiopus_sys) —
+          # начиная с CMake 3.31 без этой переменной сборка падает
+          # из-за слишком старой минимальной версии политик в libopus.
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
       - name: Переименование exe (добавляем версию в имя файла)
         run: copy target\release\voip_lan.exe voip_lan-${{ github.ref_name }}-windows-x64.exe

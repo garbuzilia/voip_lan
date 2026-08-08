@@ -26,10 +26,14 @@ jobs:
       - name: Сборка релиза
         run: cargo build --release
         env:
-          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
           # Статическая линковка CRT — итоговый .exe не потребует
           # установленного Visual C++ Redistributable на машине пользователя.
           RUSTFLAGS: "-C target-feature=+crt-static"
+          # libopus (собирается из исходников через CMake крейтом audiopus_sys,
+          # т.к. на раннере нет системной библиотеки) объявляет старую
+          # минимальную версию CMake. Начиная с CMake 3.31 такие проекты
+          # без этой переменной не собираются вообще.
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
       - name: Публикация exe как артефакт сборки
         uses: actions/upload-artifact@v4
