@@ -8,6 +8,12 @@ opt-level = 3
 lto = true
 strip = true
 
+[[bin]]
+name = "voip_lan"
+path = "src/main.rs"
+
 [dependencies]
-cpal = "0.15"   # захват/воспроизведение звука
-opus = "0.3"    # тот же кодек голоса, что использует Mumble
+cpal = "0.15"     # захват/воспроизведение звука
+opus = "0.3"      # тот же кодек голоса, что использует Mumble
+eframe = "0.28"
+egui = "0.28"

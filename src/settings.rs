@@ -2,8 +2,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 // Все "настройки" — это просто константы в коде. Единственное, что
 // реально нужно менять от пользователя к пользователю — это имя,
-// и оно спрашивается в интерактивном режиме при запуске (см. main.rs).
-// Никакого config.toml, никакого реестра — только один exe-файл.
+// оно вводится прямо в окне программы. Никакого config.toml,
+// никакого реестра — только один exe-файл.
 
 /// Порт для голосового трафика (Opus-пакеты)
 pub const VOICE_PORT: u16 = 47531;
@@ -32,38 +32,12 @@ pub const OPUS_BITRATE: i32 = 40_000;
 
 /// Общий "адрес неограниченного broadcast" — уходит через интерфейс
 /// операционной системы по умолчанию. Для Radmin VPN обычно этого
-/// достаточно, но если участники не находят друг друга, можно явно
-/// указать адрес подсети Radmin (обычно 26.x.x.255) первым аргументом
-/// командной строки: voip_lan.exe MyName 26.155.20.255
+/// достаточно, чтобы участники автоматически находили друг друга.
 pub const DEFAULT_BROADCAST_ADDR: &str = "255.255.255.255";
 
-/// Определяет имя пользователя:
-/// 1. Если передано как аргумент командной строки — используем его.
-/// 2. Иначе спрашиваем в консоли (Enter — пропустить).
-/// 3. Если ничего не введено — генерируем "UserNNNN" на основе текущего времени.
-pub fn resolve_username(cli_arg: Option<String>) -> String {
-    if let Some(name) = cli_arg {
-        if !name.trim().is_empty() {
-            return name.trim().to_string();
-        }
-    }
-
-    print!("Введите ваше имя (Enter — использовать случайное): ");
-    use std::io::Write;
-    std::io::stdout().flush().ok();
-
-    let mut input = String::new();
-    if std::io::stdin().read_line(&mut input).is_ok() {
-        let trimmed = input.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-
-    generate_random_username()
-}
-
-fn generate_random_username() -> String {
+/// Генерирует "UserNNNN" — используется как имя по умолчанию в GUI,
+/// если пользователь ничего не ввёл в поле имени.
+pub fn generate_random_username() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.subsec_nanos())

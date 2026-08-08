@@ -1,45 +1,72 @@
-use crate::network::PeerList;
 use crate::settings;
+use crate::state::SharedState;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleFormat;
 use opus::{Application, Channels, Decoder as OpusDecoder, Encoder as OpusEncoder};
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-const VOICE_MAGIC: &[u8] = b"VLV2"; // метка voice-пакетов (v2 = формат с Opus)
+const VOICE_MAGIC: &[u8] = b"VLV2";
 
 // ============================================================================
-// Ресемплер: переводит звук с "родной" частоты устройства на нужную нам
-// (48 кГц, как использует Mumble) и обратно. Простая линейная интерполяция —
-// не аудиофильское качество, но для голоса более чем достаточно и не требует
-// внешних библиотек.
+// Перечисление доступных устройств (для выпадающих списков в GUI)
 // ============================================================================
 
-/// Push-ресемплер: скармливаем ему сэмплы по мере поступления (из callback'а
-/// захвата звука), он копит хвост между вызовами и отдаёт всё, что успел
-/// пересчитать на новую частоту.
+pub fn list_input_devices() -> Vec<String> {
+    let host = cpal::default_host();
+    host.input_devices()
+        .map(|it| it.filter_map(|d| d.name().ok()).collect())
+        .unwrap_or_default()
+}
+
+pub fn list_output_devices() -> Vec<String> {
+    let host = cpal::default_host();
+    host.output_devices()
+        .map(|it| it.filter_map(|d| d.name().ok()).collect())
+        .unwrap_or_default()
+}
+
+pub fn default_input_device_name() -> Option<String> {
+    cpal::default_host().default_input_device()?.name().ok()
+}
+
+pub fn default_output_device_name() -> Option<String> {
+    cpal::default_host().default_output_device()?.name().ok()
+}
+
+fn find_input_device(name: &str) -> Option<cpal::Device> {
+    let host = cpal::default_host();
+    host.input_devices().ok()?.find(|d| d.name().map(|n| n == name).unwrap_or(false))
+}
+
+fn find_output_device(name: &str) -> Option<cpal::Device> {
+    let host = cpal::default_host();
+    host.output_devices().ok()?.find(|d| d.name().map(|n| n == name).unwrap_or(false))
+}
+
+// ============================================================================
+// Ресемплеры (см. пояснение в предыдущей версии): переводят звук с "родной"
+// частоты устройства на 48 кГц, которых требует Opus (как и у Mumble), и обратно.
+// ============================================================================
+
 struct PushResampler {
-    ratio: f64, // во сколько раз входная частота больше выходной
+    ratio: f64,
     pos: f64,
     carry: Vec<i16>,
 }
 
 impl PushResampler {
     fn new(src_rate: u32, dst_rate: u32) -> Self {
-        Self {
-            ratio: src_rate as f64 / dst_rate as f64,
-            pos: 0.0,
-            carry: Vec::new(),
-        }
+        Self { ratio: src_rate as f64 / dst_rate as f64, pos: 0.0, carry: Vec::new() }
     }
 
     fn process(&mut self, input: &[i16], out: &mut Vec<i16>) {
         self.carry.extend_from_slice(input);
-
         loop {
             let idx = self.pos.floor() as usize;
             if idx + 1 >= self.carry.len() {
@@ -52,8 +79,6 @@ impl PushResampler {
             out.push(sample.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16);
             self.pos += self.ratio;
         }
-
-        // Чистим "съеденный" хвост, чтобы carry не рос бесконечно
         let drop_count = self.pos.floor() as usize;
         if drop_count > 0 && drop_count <= self.carry.len() {
             self.carry.drain(0..drop_count);
@@ -62,11 +87,6 @@ impl PushResampler {
     }
 }
 
-/// Pull-ресемплер: используется на воспроизведении. В отличие от push-варианта,
-/// сам "тянет" сэмплы из источника (микшера) по мере необходимости —
-/// удобно, потому что cpal требует заполнить ровно `data.len()` элементов
-/// в callback'е воспроизведения, и мы не знаем заранее, сколько микшер
-/// сможет отдать.
 struct PullResampler<F: FnMut() -> i16> {
     source: F,
     ratio: f64,
@@ -79,13 +99,7 @@ impl<F: FnMut() -> i16> PullResampler<F> {
     fn new(mut source: F, src_rate: u32, dst_rate: u32) -> Self {
         let prev = source();
         let curr = source();
-        Self {
-            source,
-            ratio: src_rate as f64 / dst_rate as f64,
-            pos: 0.0,
-            prev,
-            curr,
-        }
+        Self { source, ratio: src_rate as f64 / dst_rate as f64, pos: 0.0, prev, curr }
     }
 
     fn next(&mut self) -> i16 {
@@ -101,9 +115,8 @@ impl<F: FnMut() -> i16> PullResampler<F> {
 }
 
 // ============================================================================
-// Состояние входящего голоса от одного собеседника: свой Opus-декодер
-// (у декодера есть внутреннее состояние, поэтому на каждого пира — отдельный
-// экземпляр) и очередь уже декодированных сэмплов, ждущих микширования.
+// Входящий голос от собеседников: свой Opus-декодер на каждого (у декодера
+// есть внутреннее состояние) + очередь декодированных сэмплов на микширование.
 // ============================================================================
 
 struct PeerVoice {
@@ -114,66 +127,121 @@ struct PeerVoice {
 
 type PeerAudioMap = Arc<Mutex<HashMap<SocketAddr, PeerVoice>>>;
 
-/// Честный микшер: берёт по одному сэмплу из очереди КАЖДОГО активного
-/// собеседника и складывает их вместе (с ограничением, чтобы не было
-/// переполнения при клиппинге), а не просто ставит куски в общую очередь
-/// друг за другом, как было в первой версии.
-fn pull_mixed_sample(peers_audio: &PeerAudioMap) -> i16 {
+/// Честный микшер: берёт по одному сэмплу из очереди каждого активного
+/// собеседника, умножает на его персональную громкость и складывает —
+/// а не просто сваливает куски в одну очередь друг за другом.
+fn pull_mixed_sample(peers_audio: &PeerAudioMap, state: &SharedState) -> i16 {
+    if state.sound_muted.load(Ordering::Relaxed) {
+        // Даже когда звук замьючен, продолжаем вычерпывать очереди,
+        // чтобы при размьюте не воспроизвести резко накопившуюся задержку.
+        let mut map = peers_audio.lock().unwrap();
+        for voice in map.values_mut() {
+            voice.pcm.pop_front();
+        }
+        return 0;
+    }
+
     let mut map = peers_audio.lock().unwrap();
     let mut sum: i32 = 0;
-    for state in map.values_mut() {
-        if let Some(s) = state.pcm.pop_front() {
-            sum += s as i32;
+    for (addr, voice) in map.iter_mut() {
+        if let Some(s) = voice.pcm.pop_front() {
+            let gain = state.peer_gain(addr);
+            sum += (s as f32 * gain) as i32;
         }
     }
     sum.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
 // ============================================================================
+// Публичный API: запуск/остановка голосового тракта на время "подключения"
+// ============================================================================
 
-pub fn start_audio(username: String, peers: PeerList) -> Result<(), String> {
-    let host = cpal::default_host();
+/// Хендлы всего, что нужно держать живым, пока идёт голосовой чат.
+/// `stop()` останавливает именно голосовую сессию (звук + её сетевые
+/// потоки), не трогая discovery — это позволяет менять устройство
+/// микрофона/наушников на лету, не отключая остальных участников.
+pub struct VoiceHandles {
+    pub input_stream: cpal::Stream,
+    pub output_stream: cpal::Stream,
+    pub network_threads: Vec<JoinHandle<()>>,
+    /// Отдельный от `SharedState::running` флаг: управляет только сетевыми
+    /// потоками голоса (отправка/приём/чистка), НЕ discovery. Так можно
+    /// перезапустить звук при смене устройства, не отключая остальных
+    /// участников от обнаружения.
+    pub voice_running: Arc<AtomicBool>,
+}
 
-    let input_device = host
-        .default_input_device()
-        .ok_or("Не найдено устройство ввода звука (микрофон)")?;
-    let output_device = host
-        .default_output_device()
-        .ok_or("Не найдено устройство вывода звука (динамики)")?;
+impl VoiceHandles {
+    /// Останавливает голосовую сессию: сначала дропает потоки звука
+    /// (это разрывает канал tx -> send-поток и останавливает callback'и),
+    /// затем сигналит сетевым потокам завершиться и дожидается их (join),
+    /// чтобы UDP-порт точно освободился перед повторным start_voice.
+    pub fn stop(self) {
+        drop(self.input_stream);
+        drop(self.output_stream);
+        self.voice_running.store(false, Ordering::Relaxed);
+        for handle in self.network_threads {
+            let _ = handle.join();
+        }
+    }
+}
 
-    println!("Микрофон: {}", input_device.name().unwrap_or_default());
-    println!("Динамики: {}", output_device.name().unwrap_or_default());
-    let _ = username; // имя уже используется в discovery, тут не требуется
-
-    // --- Отправка голоса: захват -> ресемплинг -> Opus -> канал -> сеть ---
-    let (tx, rx) = channel::<Vec<u8>>();
-    build_input_stream(&input_device, tx)?;
+pub fn start_voice(
+    state: SharedState,
+    input_device_name: &str,
+    output_device_name: &str,
+) -> Result<VoiceHandles, String> {
+    let input_device = find_input_device(input_device_name)
+        .ok_or_else(|| format!("Устройство ввода не найдено: {input_device_name}"))?;
+    let output_device = find_output_device(output_device_name)
+        .ok_or_else(|| format!("Устройство вывода не найдено: {output_device_name}"))?;
 
     let voice_socket = UdpSocket::bind(("0.0.0.0", settings::VOICE_PORT))
         .map_err(|e| format!("Не удалось открыть voice-порт {}: {e}", settings::VOICE_PORT))?;
+    voice_socket
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .map_err(|e| e.to_string())?;
+
+    let voice_running = Arc::new(AtomicBool::new(true));
+    let mut network_threads = Vec::new();
+
+    // --- Отправка голоса: захват -> канал -> сеть ---
+    let (tx, rx) = channel::<Vec<u8>>();
 
     let send_socket = voice_socket.try_clone().map_err(|e| e.to_string())?;
-    let peers_for_send = Arc::clone(&peers);
-    thread::spawn(move || {
-        for opus_frame in rx {
-            let mut packet = Vec::with_capacity(VOICE_MAGIC.len() + opus_frame.len());
-            packet.extend_from_slice(VOICE_MAGIC);
-            packet.extend_from_slice(&opus_frame);
+    let state_for_send = state.clone();
+    let voice_running_send = Arc::clone(&voice_running);
+    network_threads.push(thread::spawn(move || {
+        while voice_running_send.load(Ordering::Relaxed) {
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(opus_frame) => {
+                    let mut packet = Vec::with_capacity(VOICE_MAGIC.len() + opus_frame.len());
+                    packet.extend_from_slice(VOICE_MAGIC);
+                    packet.extend_from_slice(&opus_frame);
 
-            let targets: Vec<_> = peers_for_send.lock().unwrap().values().cloned().collect();
-            for peer in targets {
-                let _ = send_socket.send_to(&packet, peer.voice_addr);
+                    let targets: Vec<_> = state_for_send.peers.lock().unwrap().values().cloned().collect();
+                    for peer in targets {
+                        let _ = send_socket.send_to(&packet, peer.voice_addr);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-    });
+    }));
+
+    let input_stream = build_input_stream(&input_device, state.clone(), tx)?;
 
     // --- Приём голоса: сеть -> Opus-декодер (свой на пира) -> очередь пира ---
     let peers_audio: PeerAudioMap = Arc::new(Mutex::new(HashMap::new()));
+
     let recv_socket = voice_socket;
     let peers_audio_for_recv = Arc::clone(&peers_audio);
-    thread::spawn(move || {
+    let state_for_recv = state.clone();
+    let voice_running_recv = Arc::clone(&voice_running);
+    network_threads.push(thread::spawn(move || {
         let mut buf = [0u8; 4096];
-        loop {
+        while voice_running_recv.load(Ordering::Relaxed) {
             match recv_socket.recv_from(&mut buf) {
                 Ok((len, src)) => {
                     if len < VOICE_MAGIC.len() || &buf[..VOICE_MAGIC.len()] != VOICE_MAGIC {
@@ -182,7 +250,7 @@ pub fn start_audio(username: String, peers: PeerList) -> Result<(), String> {
                     let opus_data = &buf[VOICE_MAGIC.len()..len];
 
                     let mut map = peers_audio_for_recv.lock().unwrap();
-                    let state = map.entry(src).or_insert_with(|| PeerVoice {
+                    let voice = map.entry(src).or_insert_with(|| PeerVoice {
                         decoder: OpusDecoder::new(settings::SAMPLE_RATE, Channels::Mono)
                             .expect("не удалось создать Opus-декодер"),
                         pcm: VecDeque::new(),
@@ -190,45 +258,49 @@ pub fn start_audio(username: String, peers: PeerList) -> Result<(), String> {
                     });
 
                     let mut pcm_out = vec![0i16; settings::FRAME_SIZE];
-                    match state.decoder.decode(opus_data, &mut pcm_out, false) {
+                    match voice.decoder.decode(opus_data, &mut pcm_out, false) {
                         Ok(decoded_len) => {
-                            state.pcm.extend(&pcm_out[..decoded_len]);
-                            state.last_packet = Instant::now();
-                            // Не даём очереди одного пира расти бесконечно,
-                            // если микшер по какой-то причине не успевает её вычерпывать
-                            while state.pcm.len() > settings::SAMPLE_RATE as usize {
-                                state.pcm.pop_front();
+                            voice.pcm.extend(&pcm_out[..decoded_len]);
+                            voice.last_packet = Instant::now();
+                            while voice.pcm.len() > settings::SAMPLE_RATE as usize {
+                                voice.pcm.pop_front();
                             }
                         }
                         Err(e) => {
-                            eprintln!("Ошибка декодирования Opus-пакета от {src}: {e}");
+                            state_for_recv.log(format!("Ошибка декодирования Opus-пакета от {src}: {e}"));
                         }
                     }
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                    continue;
+                }
                 Err(e) => {
-                    eprintln!("Ошибка приёма голосового пакета: {e}");
+                    state_for_recv.log(format!("Ошибка приёма голосового пакета: {e}"));
                 }
             }
         }
-    });
+    }));
 
-    // Периодически убираем декодеры собеседников, от которых давно нет пакетов
+    // Периодическая чистка декодеров собеседников, от которых давно нет пакетов
     let peers_audio_for_cleanup = Arc::clone(&peers_audio);
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(5));
-        let mut map = peers_audio_for_cleanup.lock().unwrap();
-        map.retain(|_, state| state.last_packet.elapsed() < Duration::from_secs(settings::PEER_TIMEOUT_SECS));
-    });
+    let voice_running_cleanup = Arc::clone(&voice_running);
+    network_threads.push(thread::spawn(move || {
+        while voice_running_cleanup.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(500));
+            let mut map = peers_audio_for_cleanup.lock().unwrap();
+            map.retain(|_, voice| voice.last_packet.elapsed() < Duration::from_secs(settings::PEER_TIMEOUT_SECS));
+        }
+    }));
 
-    build_output_stream(&output_device, peers_audio)?;
+    let output_stream = build_output_stream(&output_device, state, peers_audio)?;
 
-    Ok(())
+    Ok(VoiceHandles { input_stream, output_stream, network_threads, voice_running })
 }
 
-/// Настраивает поток захвата с микрофона: даунмикс в моно (если каналов
-/// больше одного) + ресемплинг до 48 кГц + буферизация во фреймы по 480
-/// сэмплов (10 мс, как у Mumble) + кодирование в Opus + отправка в канал.
-fn build_input_stream(device: &cpal::Device, tx: Sender<Vec<u8>>) -> Result<(), String> {
+/// Захват микрофона: даунмикс в моно + ресемплинг до 48 кГц + буферизация
+/// во фреймы по 480 сэмплов (10 мс, как у Mumble) + громкость/мьют +
+/// кодирование в Opus + отправка в канал на сетевой поток.
+fn build_input_stream(device: &cpal::Device, state: SharedState, tx: Sender<Vec<u8>>) -> Result<cpal::Stream, String> {
     let supported_config = device
         .default_input_config()
         .map_err(|e| format!("Нет доступной конфигурации микрофона: {e}"))?;
@@ -237,75 +309,32 @@ fn build_input_stream(device: &cpal::Device, tx: Sender<Vec<u8>>) -> Result<(), 
     let channels = stream_config.channels as usize;
     let native_rate = stream_config.sample_rate.0;
 
-    let mut encoder = OpusEncoder::new(settings::SAMPLE_RATE, Channels::Mono, Application::Voip)
-        .map_err(|e| format!("Не удалось создать Opus-энкодер: {e}"))?;
-    encoder
-        .set_bitrate(opus::Bitrate::Bits(settings::OPUS_BITRATE))
-        .ok();
-
-    let mut resampler = PushResampler::new(native_rate, settings::SAMPLE_RATE);
-    let mut frame_accum: Vec<i16> = Vec::with_capacity(settings::FRAME_SIZE * 2);
-    let mut resampled: Vec<i16> = Vec::new();
-    let mut opus_out = vec![0u8; 4000]; // с запасом, реальный Opus-фрейм намного меньше
-
-    let err_fn = |err| eprintln!("Ошибка потока захвата звука: {err}");
-
-    let mut encode_and_send = move |mono: &[i16], tx: &Sender<Vec<u8>>| {
-        resampled.clear();
-        resampler.process(mono, &mut resampled);
-        frame_accum.extend_from_slice(&resampled);
-
-        while frame_accum.len() >= settings::FRAME_SIZE {
-            let frame: Vec<i16> = frame_accum.drain(..settings::FRAME_SIZE).collect();
-            match encoder.encode(&frame, &mut opus_out) {
-                Ok(len) => {
-                    let _ = tx.send(opus_out[..len].to_vec());
-                }
-                Err(e) => eprintln!("Ошибка кодирования Opus: {e}"),
-            }
+    match sample_format {
+        SampleFormat::I16 => {
+            build_input_stream_typed::<i16>(device, &stream_config, channels, native_rate, state, tx, downmix_i16)
         }
-    };
-
-    let stream = match sample_format {
-        SampleFormat::I16 => device.build_input_stream(
-            &stream_config,
-            move |data: &[i16], _| {
-                let mono = downmix_i16(data, channels);
-                encode_and_send(&mono, &tx);
-            },
-            err_fn,
-            None,
-        ),
         SampleFormat::F32 => {
-            // Второй замыкающий блок не может переиспользовать `encode_and_send`
-            // из ветки I16 (перемещено по move), поэтому пересобираем поток
-            // захвата целиком под F32 с собственным набором состояний.
-            return build_input_stream_f32(device, &stream_config, channels, tx);
+            build_input_stream_typed::<f32>(device, &stream_config, channels, native_rate, state, tx, downmix_f32)
         }
-        other => return Err(format!("Неподдерживаемый формат сэмплов микрофона: {other:?}")),
+        other => Err(format!("Неподдерживаемый формат сэмплов микрофона: {other:?}")),
     }
-    .map_err(|e| format!("Не удалось создать поток захвата: {e}"))?;
-
-    stream.play().map_err(|e| format!("Не удалось запустить захват звука: {e}"))?;
-    std::mem::forget(stream); // поток должен жить всю программу
-    Ok(())
 }
 
-/// Отдельная функция для формата F32 — избегает конфликта владения
-/// замыканием между двумя ветками build_input_stream.
-fn build_input_stream_f32(
+fn build_input_stream_typed<T>(
     device: &cpal::Device,
     stream_config: &cpal::StreamConfig,
     channels: usize,
+    native_rate: u32,
+    state: SharedState,
     tx: Sender<Vec<u8>>,
-) -> Result<(), String> {
-    let native_rate = stream_config.sample_rate.0;
-
+    downmix: fn(&[T], usize) -> Vec<i16>,
+) -> Result<cpal::Stream, String>
+where
+    T: cpal::Sample + cpal::SizedSample + Send + 'static,
+{
     let mut encoder = OpusEncoder::new(settings::SAMPLE_RATE, Channels::Mono, Application::Voip)
         .map_err(|e| format!("Не удалось создать Opus-энкодер: {e}"))?;
-    encoder
-        .set_bitrate(opus::Bitrate::Bits(settings::OPUS_BITRATE))
-        .ok();
+    encoder.set_bitrate(opus::Bitrate::Bits(settings::OPUS_BITRATE)).ok();
 
     let mut resampler = PushResampler::new(native_rate, settings::SAMPLE_RATE);
     let mut frame_accum: Vec<i16> = Vec::with_capacity(settings::FRAME_SIZE * 2);
@@ -317,8 +346,19 @@ fn build_input_stream_f32(
     let stream = device
         .build_input_stream(
             stream_config,
-            move |data: &[f32], _| {
-                let mono = downmix_f32(data, channels);
+            move |data: &[T], _| {
+                if state.mic_muted.load(Ordering::Relaxed) {
+                    return; // микрофон замьючен — ничего не кодируем и не шлём
+                }
+
+                let mut mono = downmix(data, channels);
+                let gain = *state.mic_gain.lock().unwrap();
+                if (gain - 1.0).abs() > f32::EPSILON {
+                    for s in mono.iter_mut() {
+                        *s = (*s as f32 * gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                    }
+                }
+
                 resampled.clear();
                 resampler.process(&mono, &mut resampled);
                 frame_accum.extend_from_slice(&resampled);
@@ -339,14 +379,13 @@ fn build_input_stream_f32(
         .map_err(|e| format!("Не удалось создать поток захвата: {e}"))?;
 
     stream.play().map_err(|e| format!("Не удалось запустить захват звука: {e}"))?;
-    std::mem::forget(stream);
-    Ok(())
+    Ok(stream)
 }
 
-/// Настраивает поток воспроизведения: тянет уже смикшированный (сумма
-/// всех говорящих) сигнал на 48 кГц через ресемплер до частоты устройства
-/// и дублирует в нужное число каналов.
-fn build_output_stream(device: &cpal::Device, peers_audio: PeerAudioMap) -> Result<(), String> {
+/// Воспроизведение: тянет уже смикшированный (сумма всех говорящих,
+/// с учётом персональной громкости и общего мьюта) сигнал на 48 кГц
+/// через ресемплер до частоты устройства и дублирует в нужное число каналов.
+fn build_output_stream(device: &cpal::Device, state: SharedState, peers_audio: PeerAudioMap) -> Result<cpal::Stream, String> {
     let supported_config = device
         .default_output_config()
         .map_err(|e| format!("Нет доступной конфигурации динамиков: {e}"))?;
@@ -355,7 +394,7 @@ fn build_output_stream(device: &cpal::Device, peers_audio: PeerAudioMap) -> Resu
     let channels = stream_config.channels as usize;
     let native_rate = stream_config.sample_rate.0;
 
-    let source = move || pull_mixed_sample(&peers_audio);
+    let source = move || pull_mixed_sample(&peers_audio, &state);
     let mut resampler = PullResampler::new(source, settings::SAMPLE_RATE, native_rate);
 
     let err_fn = |err| eprintln!("Ошибка потока воспроизведения: {err}");
@@ -392,8 +431,7 @@ fn build_output_stream(device: &cpal::Device, peers_audio: PeerAudioMap) -> Resu
     .map_err(|e| format!("Не удалось создать поток воспроизведения: {e}"))?;
 
     stream.play().map_err(|e| format!("Не удалось запустить воспроизведение: {e}"))?;
-    std::mem::forget(stream);
-    Ok(())
+    Ok(stream)
 }
 
 fn downmix_i16(data: &[i16], channels: usize) -> Vec<i16> {
