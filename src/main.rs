@@ -1,3 +1,7 @@
+// Прячем консольное окно в release-сборке (в debug оно остаётся —
+// пригодится, если что-то падает ещё до открытия окна).
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod audio;
 mod gui;
 mod network;
