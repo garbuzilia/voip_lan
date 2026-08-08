@@ -26,6 +26,7 @@ jobs:
       - name: Сборка релиза
         run: cargo build --release
         env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
           # Статическая линковка CRT — итоговый .exe не потребует
           # установленного Visual C++ Redistributable на машине пользователя.
           RUSTFLAGS: "-C target-feature=+crt-static"
