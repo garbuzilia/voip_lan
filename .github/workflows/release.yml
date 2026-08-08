@@ -1,0 +1,39 @@
+name: Release
+
+# Срабатывает, когда вы создаёте и пушите тег вида v1.0, v1.1 и т.д.:
+#   git tag v1.0
+#   git push origin v1.0
+# После этого в разделе "Releases" репозитория появится готовый .exe.
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release-windows:
+    name: Windows x64 release
+    runs-on: windows-latest
+    permissions:
+      contents: write # нужно, чтобы workflow мог создать Release
+    steps:
+      - name: Checkout репозитория
+        uses: actions/checkout@v4
+
+      - name: Установка Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Кэш зависимостей Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Сборка релиза
+        run: cargo build --release
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+
+      - name: Переименование exe (добавляем версию в имя файла)
+        run: copy target\release\voip_lan.exe voip_lan-${{ github.ref_name }}-windows-x64.exe
+
+      - name: Публикация в GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: voip_lan-${{ github.ref_name }}-windows-x64.exe

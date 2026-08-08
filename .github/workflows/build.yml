@@ -1,0 +1,38 @@
+name: Build
+
+# Запускается автоматически при каждом push в main/master,
+# а также вручную из вкладки Actions на GitHub (кнопка "Run workflow").
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch: {}
+
+jobs:
+  build-windows:
+    name: Windows x64 (release)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout репозитория
+        uses: actions/checkout@v4
+
+      - name: Установка Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Кэш зависимостей Cargo (ускоряет повторные сборки)
+        uses: Swatinem/rust-cache@v2
+
+      - name: Сборка релиза
+        run: cargo build --release
+        env:
+          # Статическая линковка CRT — итоговый .exe не потребует
+          # установленного Visual C++ Redistributable на машине пользователя.
+          RUSTFLAGS: "-C target-feature=+crt-static"
+
+      - name: Публикация exe как артефакт сборки
+        uses: actions/upload-artifact@v4
+        with:
+          name: voip_lan-windows-x64
+          path: target/release/voip_lan.exe
+          if-no-files-found: error
