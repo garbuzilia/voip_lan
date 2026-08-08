@@ -28,6 +28,7 @@ jobs:
       - name: Сборка релиза
         run: cargo build --release
         env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
           RUSTFLAGS: "-C target-feature=+crt-static"
 
       - name: Переименование exe (добавляем версию в имя файла)
