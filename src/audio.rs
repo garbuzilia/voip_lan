@@ -161,7 +161,10 @@ fn pull_mixed_sample(peers_audio: &PeerAudioMap, state: &SharedState) -> i16 {
 /// потоки), не трогая discovery — это позволяет менять устройство
 /// микрофона/наушников на лету, не отключая остальных участников.
 pub struct VoiceHandles {
-    pub input_stream: cpal::Stream,
+    /// None, если голосовая сессия запущена без микрофона (например,
+    /// пользователь хочет просто слушать канал) — захват звука тогда
+    /// не запускается вовсе, а не просто "молчит".
+    pub input_stream: Option<cpal::Stream>,
     pub output_stream: cpal::Stream,
     pub network_threads: Vec<JoinHandle<()>>,
     /// Отдельный от `SharedState::running` флаг: управляет только сетевыми
@@ -191,8 +194,18 @@ pub fn start_voice(
     input_device_name: &str,
     output_device_name: &str,
 ) -> Result<VoiceHandles, String> {
-    let input_device = find_input_device(input_device_name)
-        .ok_or_else(|| format!("Устройство ввода не найдено: {input_device_name}"))?;
+    // Микрофон опционален: пустая строка = "без микрофона", осознанный
+    // выбор пользователя (или единственный вариант, если устройств ввода
+    // в системе вообще нет). В этом случае просто не поднимаем захват
+    // звука — приём и воспроизведение чужого голоса работают как обычно.
+    let input_device = if input_device_name.is_empty() {
+        None
+    } else {
+        Some(
+            find_input_device(input_device_name)
+                .ok_or_else(|| format!("Устройство ввода не найдено: {input_device_name}"))?,
+        )
+    };
     let output_device = find_output_device(output_device_name)
         .ok_or_else(|| format!("Устройство вывода не найдено: {output_device_name}"))?;
 
@@ -205,32 +218,37 @@ pub fn start_voice(
     let voice_running = Arc::new(AtomicBool::new(true));
     let mut network_threads = Vec::new();
 
-    // --- Отправка голоса: захват -> канал -> сеть ---
-    let (tx, rx) = channel::<Vec<u8>>();
+    // --- Отправка голоса: захват -> канал -> сеть (только если есть микрофон) ---
+    let input_stream = if let Some(input_device) = input_device {
+        let (tx, rx) = channel::<Vec<u8>>();
 
-    let send_socket = voice_socket.try_clone().map_err(|e| e.to_string())?;
-    let state_for_send = state.clone();
-    let voice_running_send = Arc::clone(&voice_running);
-    network_threads.push(thread::spawn(move || {
-        while voice_running_send.load(Ordering::Relaxed) {
-            match rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(opus_frame) => {
-                    let mut packet = Vec::with_capacity(VOICE_MAGIC.len() + opus_frame.len());
-                    packet.extend_from_slice(VOICE_MAGIC);
-                    packet.extend_from_slice(&opus_frame);
+        let send_socket = voice_socket.try_clone().map_err(|e| e.to_string())?;
+        let state_for_send = state.clone();
+        let voice_running_send = Arc::clone(&voice_running);
+        network_threads.push(thread::spawn(move || {
+            while voice_running_send.load(Ordering::Relaxed) {
+                match rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(opus_frame) => {
+                        let mut packet = Vec::with_capacity(VOICE_MAGIC.len() + opus_frame.len());
+                        packet.extend_from_slice(VOICE_MAGIC);
+                        packet.extend_from_slice(&opus_frame);
 
-                    let targets: Vec<_> = state_for_send.peers.lock().unwrap().values().cloned().collect();
-                    for peer in targets {
-                        let _ = send_socket.send_to(&packet, peer.voice_addr);
+                        let targets: Vec<_> = state_for_send.peers.lock().unwrap().values().cloned().collect();
+                        for peer in targets {
+                            let _ = send_socket.send_to(&packet, peer.voice_addr);
+                        }
                     }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
-        }
-    }));
+        }));
 
-    let input_stream = build_input_stream(&input_device, state.clone(), tx)?;
+        Some(build_input_stream(&input_device, state.clone(), tx)?)
+    } else {
+        state.log("Подключение без микрофона — только приём звука");
+        None
+    };
 
     // --- Приём голоса: сеть -> Opus-декодер (свой на пира) -> очередь пира ---
     let peers_audio: PeerAudioMap = Arc::new(Mutex::new(HashMap::new()));

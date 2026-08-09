@@ -13,14 +13,10 @@ pub const INITIAL_HEIGHT: f32 = 460.0;
 /// Нижний предел высоты окна: не даём окну сжаться до почти квадратных
 /// пропорций даже когда контента совсем мало (пустой список участников).
 const MIN_WINDOW_HEIGHT: f32 = 460.0;
-/// Верхний предел высоты окна (на случай очень длинного списка участников
-/// или большого количества логов) — дальше начинает работать прокрутка,
-/// а не бесконечный рост окна.
+/// Верхний предел высоты окна (на случай очень длинного списка участников)
+/// — дальше начинает работать прокрутка, а не бесконечный рост окна.
+/// Панель логов теперь фиксированного размера и сюда не влияет.
 const MAX_WINDOW_HEIGHT: f32 = 700.0;
-/// Зарезервированная минимальная высота под блок участников — так
-/// настройки ниже всегда начинаются на одной и той же высоте, даже
-/// когда участников мало или нет совсем (тогда просто пустое место).
-const PEERS_SECTION_MIN_HEIGHT: f32 = 110.0;
 
 pub struct VoipApp {
     state: SharedState,
@@ -34,6 +30,10 @@ pub struct VoipApp {
     connected: bool,
     voice: Option<audio::VoiceHandles>,
     discovery_handles: Vec<JoinHandle<()>>,
+    /// Имя, под которым сейчас реально анонсируемся в discovery — если
+    /// пользователь поменял поле "Имя", но ещё не увёл фокус, discovery
+    /// продолжает объявлять старое имя, пока мы не перезапустим его.
+    last_announced_username: String,
 
     last_cleanup: Instant,
     /// Когда в последний раз перечисляли устройства ввода/вывода —
@@ -41,19 +41,16 @@ pub struct VoipApp {
     /// микрофон/наушники появлялись без перезапуска программы.
     last_device_refresh: Instant,
 
-    /// Открыта ли панель логов (передаётся в CollapsingHeader и
-    /// переключается по клику на заголовок).
-    logs_open: bool,
     /// Последний размер окна, который мы сами применили — чтобы не слать
     /// команду на resize каждый кадр, а только когда реальный размер
     /// контента изменился.
     last_window_size: egui::Vec2,
     /// Снимок того, что реально влияет на высоту layout'а (количество
-    /// участников и открыт ли лог). Пересчитываем и меняем размер окна
-    /// ТОЛЬКО когда это снимок реально поменялся — а не на каждом кадре,
-    /// иначе постоянные resize-команды заметно мешают перетаскиванию
-    /// окна мышкой (конфликтуют с системным перемещением окна).
-    last_layout_signature: (usize, bool),
+    /// участников). Пересчитываем и меняем размер окна ТОЛЬКО когда этот
+    /// снимок реально поменялся — а не на каждом кадре, иначе постоянные
+    /// resize-команды заметно мешают перетаскиванию окна мышкой
+    /// (конфликтуют с системным перемещением окна).
+    last_layout_signature: usize,
 }
 
 impl VoipApp {
@@ -67,21 +64,34 @@ impl VoipApp {
             .or_else(|| output_devices.first().cloned())
             .unwrap_or_default();
 
+        let state = SharedState::new();
+        let username = settings::generate_random_username();
+
+        // Discovery запускается сразу при старте программы, а не по кнопке
+        // "Подключиться" — пользователь должен видеть, есть ли кто-то
+        // в канале, ещё до того, как решит присоединиться голосом.
+        state.running.store(true, Ordering::Relaxed);
+        let discovery_handles = network::start_discovery(
+            username.clone(),
+            settings::DEFAULT_BROADCAST_ADDR.to_string(),
+            state.clone(),
+        );
+
         Self {
-            state: SharedState::new(),
-            username: settings::generate_random_username(),
+            state,
+            username: username.clone(),
             input_devices,
             output_devices,
             selected_input,
             selected_output,
             connected: false,
             voice: None,
-            discovery_handles: Vec::new(),
+            discovery_handles,
+            last_announced_username: username,
             last_cleanup: Instant::now(),
             last_device_refresh: Instant::now(),
-            logs_open: false,
             last_window_size: egui::vec2(WINDOW_WIDTH, INITIAL_HEIGHT),
-            last_layout_signature: (0, false),
+            last_layout_signature: 0,
         }
     }
 
@@ -90,35 +100,17 @@ impl VoipApp {
             return;
         }
 
-        let username = if self.username.trim().is_empty() {
-            settings::generate_random_username()
-        } else {
-            self.username.trim().to_string()
-        };
-        self.username = username.clone();
-
-        self.state.running.store(true, Ordering::Relaxed);
-        let discovery_handles = network::start_discovery(
-            username,
-            settings::DEFAULT_BROADCAST_ADDR.to_string(),
-            self.state.clone(),
-        );
-
+        // Микрофон необязателен — можно подключиться и просто слушать
+        // канал, а микрофон подключить "на горячую" позже, выбрав его
+        // в списке устройств (см. device_changed в update()).
         match audio::start_voice(self.state.clone(), &self.selected_input, &self.selected_output) {
             Ok(handles) => {
-                self.discovery_handles = discovery_handles;
                 self.voice = Some(handles);
                 self.connected = true;
                 self.state.log("Подключено");
             }
             Err(e) => {
                 self.state.log(format!("Не удалось запустить звук: {e}"));
-                // Discovery уже запустили — аккуратно останавливаем его,
-                // раз аудио не поднялось, чтобы не остаться в подвешенном состоянии.
-                self.state.running.store(false, Ordering::Relaxed);
-                for h in discovery_handles {
-                    let _ = h.join();
-                }
             }
         }
     }
@@ -127,20 +119,16 @@ impl VoipApp {
         if !self.connected {
             return;
         }
-        self.state.running.store(false, Ordering::Relaxed);
         if let Some(voice) = self.voice.take() {
             voice.stop();
         }
-        for h in std::mem::take(&mut self.discovery_handles) {
-            let _ = h.join();
-        }
-        self.state.peers.lock().unwrap().clear();
         self.connected = false;
         self.state.log("Отключено");
     }
 
-    /// Перезапускает только звук (например, при смене устройства ввода/вывода),
-    /// не трогая discovery — остальные участники не "отваливаются" на это время.
+    /// Перезапускает только звук (например, при смене устройства ввода/вывода,
+    /// в том числе "горячее" подключение микрофона), не трогая discovery —
+    /// остальные участники не "отваливаются" на это время.
     fn restart_voice(&mut self) {
         if !self.connected {
             return;
@@ -158,16 +146,54 @@ impl VoipApp {
             }
         }
     }
+
+    /// Перезапускает discovery с новым именем — вызывается при уходе
+    /// фокуса с поля "Имя", если имя реально поменялось. Работает
+    /// независимо от голосового подключения.
+    fn restart_discovery(&mut self) {
+        let username = if self.username.trim().is_empty() {
+            settings::generate_random_username()
+        } else {
+            self.username.trim().to_string()
+        };
+        self.username = username.clone();
+        if username == self.last_announced_username {
+            return;
+        }
+
+        self.state.running.store(false, Ordering::Relaxed);
+        for h in std::mem::take(&mut self.discovery_handles) {
+            let _ = h.join();
+        }
+        self.state.peers.lock().unwrap().clear();
+
+        self.state.running.store(true, Ordering::Relaxed);
+        self.discovery_handles = network::start_discovery(
+            username.clone(),
+            settings::DEFAULT_BROADCAST_ADDR.to_string(),
+            self.state.clone(),
+        );
+        self.last_announced_username = username;
+    }
+
+    /// Останавливает discovery полностью — только при закрытии программы.
+    fn stop_discovery(&mut self) {
+        self.state.running.store(false, Ordering::Relaxed);
+        for h in std::mem::take(&mut self.discovery_handles) {
+            let _ = h.join();
+        }
+    }
 }
 
 impl eframe::App for VoipApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Отключаем плавную анимацию сворачивания/разворачивания у виджетов
-        // (например, у CollapsingHeader с логами). Без этого измеренная
-        // высота контента меняется постепенно на протяжении ~12-15 кадров,
-        // и автоподгонка размера окна ниже честно следует за каждым
-        // промежуточным значением — окно "доезжает" до цели желеобразными
-        // рывками вместо одного мгновенного прыжка.
+        // Отключаем плавную анимацию виджетов egui. Раньше в программе был
+        // сворачиваемый блок логов, и его анимация раскрытия растягивала
+        // изменение измеренной высоты контента на ~12-15 кадров, из-за чего
+        // автоподгонка размера окна "доезжала" до цели желеобразными
+        // рывками вместо мгновенного прыжка. Блока больше нет, но оставляем
+        // отключённые анимации на будущее — на случай других виджетов,
+        // влияющих на размер окна.
         ctx.style_mut(|style| style.animation_time = 0.0);
 
         // Периодически чистим "отвалившихся" участников. Экран перерисовываем
@@ -180,11 +206,33 @@ impl eframe::App for VoipApp {
 
         // Периодически обновляем список устройств — чтобы подключённые
         // "на лету" микрофон/наушники появились в выпадающем списке
-        // без перезапуска программы.
+        // без перезапуска программы (и наоборот — отключённые пропали).
+        let mut device_selection_changed = false;
         if self.last_device_refresh.elapsed() > Duration::from_secs(2) {
             self.input_devices = audio::list_input_devices();
             self.output_devices = audio::list_output_devices();
             self.last_device_refresh = Instant::now();
+
+            // Микрофон: пустая строка ("Без микрофона") — всегда валидный
+            // осознанный выбор, её не трогаем. Но если был выбран конкретный
+            // микрофон, а он пропал из списка (отключили физически) —
+            // название не должно "зависать" в интерфейсе как ни в чём не бывало.
+            if !self.selected_input.is_empty() && !self.input_devices.contains(&self.selected_input) {
+                self.selected_input = self.input_devices.first().cloned().unwrap_or_default();
+                self.state.log("Микрофон отключён от системы");
+                device_selection_changed = true;
+            }
+
+            // Наушники/динамики обязательны для работы звука — если пропали,
+            // переключаемся на первое доступное устройство, если оно есть.
+            if !self.selected_output.is_empty() && !self.output_devices.contains(&self.selected_output) {
+                self.selected_output = self.output_devices.first().cloned().unwrap_or_default();
+                self.state.log("Устройство вывода звука отключено от системы");
+                device_selection_changed = true;
+            }
+        }
+        if device_selection_changed {
+            self.restart_voice();
         }
         ctx.request_repaint_after(Duration::from_millis(200));
 
@@ -197,12 +245,17 @@ impl eframe::App for VoipApp {
             ui.add_space(8.0);
 
             // --- Имя пользователя ---
-            ui.add_enabled(
-                !self.connected,
+            // Поле активно всегда (discovery работает независимо от кнопки
+            // "Подключиться") — новое имя применяется, когда поле теряет
+            // фокус, чтобы не перезапускать discovery на каждую нажатую клавишу.
+            let username_response = ui.add(
                 egui::TextEdit::singleline(&mut self.username)
                     .hint_text("Имя")
                     .desired_width(f32::INFINITY),
             );
+            if username_response.lost_focus() {
+                self.restart_discovery();
+            }
 
             ui.add_space(12.0);
 
@@ -215,26 +268,25 @@ impl eframe::App for VoipApp {
             };
             peer_count = peers.len();
 
-            ui.scope(|ui| {
-                ui.set_min_height(PEERS_SECTION_MIN_HEIGHT);
-                if peers.is_empty() {
-                    ui.weak("Участников пока нет");
-                } else {
-                    for (addr, name) in &peers {
-                        let mut gain = self.state.peer_gain(addr);
-                        ui.horizontal(|ui| {
-                            ui.label(name);
-                            let remaining = (ui.available_width() - 55.0).max(40.0);
-                            ui.spacing_mut().slider_width = remaining;
-                            if ui.add(egui::Slider::new(&mut gain, 0.0..=2.0)).changed() {
-                                self.state.set_peer_gain(*addr, gain);
-                            }
-                        });
-                    }
+            if peers.is_empty() {
+                ui.weak("Участников пока нет");
+            } else {
+                for (addr, name) in &peers {
+                    let mut gain = self.state.peer_gain(addr);
+                    ui.horizontal(|ui| {
+                        ui.label(name);
+                        let remaining = (ui.available_width() - 55.0).max(40.0);
+                        ui.spacing_mut().slider_width = remaining;
+                        if ui.add(egui::Slider::new(&mut gain, 0.0..=2.0)).changed() {
+                            self.state.set_peer_gain(*addr, gain);
+                        }
+                    });
                 }
-            });
+            }
 
-            ui.add_space(10.0);
+            ui.add_space(14.0);
+            ui.separator();
+            ui.add_space(14.0);
 
             // --- Мьют микрофона / звука — обычные подписанные кнопки в одну строку ---
             let full_width = ui.available_width();
@@ -287,10 +339,21 @@ impl eframe::App for VoipApp {
             let mut device_changed = false;
 
             ui.label("Микрофон:");
+            let input_selected_text = if self.selected_input.is_empty() {
+                "Без микрофона".to_string()
+            } else {
+                truncate_label(&self.selected_input, 40)
+            };
             egui::ComboBox::from_id_source("input_device")
                 .width(window_width)
-                .selected_text(truncate_label(&self.selected_input, 40))
+                .selected_text(input_selected_text)
                 .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_value(&mut self.selected_input, String::new(), "Без микрофона")
+                        .changed()
+                    {
+                        device_changed = true;
+                    }
                     for name in self.input_devices.clone() {
                         if ui
                             .selectable_value(&mut self.selected_input, name.clone(), truncate_label(&name, 60))
@@ -304,9 +367,14 @@ impl eframe::App for VoipApp {
             ui.add_space(6.0);
 
             ui.label("Наушники / динамики:");
+            let output_selected_text = if self.selected_output.is_empty() {
+                "Не выбрано".to_string()
+            } else {
+                truncate_label(&self.selected_output, 40)
+            };
             egui::ComboBox::from_id_source("output_device")
                 .width(window_width)
-                .selected_text(truncate_label(&self.selected_output, 40))
+                .selected_text(output_selected_text)
                 .show_ui(ui, |ui| {
                     for name in self.output_devices.clone() {
                         if ui
@@ -344,39 +412,32 @@ impl eframe::App for VoipApp {
 
             ui.add_space(10.0);
 
-            // --- Логи: свёрнуты по умолчанию; при разворачивании окно
-            //     программы увеличивается по высоте (см. update()) ---
+            // --- Логи: постоянно видимый прямоугольник фиксированной
+            //     высоты со своей прокруткой (не сворачивается) ---
             let full_width = ui.available_width();
-            let header_response = egui::CollapsingHeader::new("Логи")
-                .open(Some(self.logs_open))
+            ui.label("Логи");
+            egui::Frame::none()
+                .fill(egui::Color32::from_gray(60))
+                .inner_margin(6.0)
                 .show(ui, |ui| {
-                    ui.set_min_width(full_width);
-                    egui::Frame::none()
-                        .fill(egui::Color32::from_gray(60))
-                        .inner_margin(6.0)
+                    ui.set_min_width(full_width - 12.0);
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .max_height(180.0)
                         .show(ui, |ui| {
-                            ui.set_min_width(full_width - 12.0);
-                            egui::ScrollArea::vertical()
-                                .stick_to_bottom(true)
-                                .max_height(180.0)
-                                .show(ui, |ui| {
-                                    ui.set_min_width(full_width - 24.0);
-                                    ui.set_min_height(160.0);
-                                    let logs = self.state.logs.lock().unwrap();
-                                    if logs.is_empty() {
-                                        ui.weak("Пока пусто");
-                                    } else {
-                                        for line in logs.iter() {
-                                            ui.colored_label(egui::Color32::WHITE, line);
-                                        }
-                                    }
-                                });
+                            ui.set_min_width(full_width - 24.0);
+                            ui.set_min_height(160.0);
+                            let logs = self.state.logs.lock().unwrap();
+                            if logs.is_empty() {
+                                ui.weak("Пока пусто");
+                            } else {
+                                for line in logs.iter() {
+                                    ui.colored_label(egui::Color32::WHITE, line);
+                                }
+                            }
                         });
                 });
-            if header_response.header_response.clicked() {
-                self.logs_open = !self.logs_open;
-            }
-            }); // конец ScrollArea
+            });
         });
 
         // Автоподгонка размера окна под реальный размер содержимого —
@@ -386,8 +447,8 @@ impl eframe::App for VoipApp {
         // ещё и перетаскивали мышкой, resize-команда конфликтовала с
         // системным перемещением окна, отсюда и лаг/желе при переносе.
         // Теперь пересчитываем размер только когда реально поменялось
-        // что-то, что влияет на высоту (число участников, открыт ли лог).
-        let signature = (peer_count, self.logs_open);
+        // что-то, что влияет на высоту (число участников).
+        let signature = peer_count;
         if signature != self.last_layout_signature {
             self.last_layout_signature = signature;
             let used = ctx.used_size();
@@ -400,9 +461,10 @@ impl eframe::App for VoipApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Аккуратно останавливаем потоки при закрытии окна, чтобы порты
-        // освободились сразу, а не спустя таймаут ОС.
+        // Аккуратно останавливаем всё при закрытии окна (голос и discovery),
+        // чтобы порты освободились сразу, а не спустя таймаут ОС.
         self.disconnect();
+        self.stop_discovery();
     }
 }
 
