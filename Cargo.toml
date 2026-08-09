@@ -15,5 +15,5 @@ path = "src/main.rs"
 [dependencies]
 cpal = "0.15"     # захват/воспроизведение звука
 opus = "0.3"      # тот же кодек голоса, что использует Mumble
-eframe = "0.28"
+eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts"] }
 egui = "0.28"

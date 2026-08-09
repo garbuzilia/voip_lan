@@ -13,6 +13,11 @@ fn main() -> eframe::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([380.0, gui::INITIAL_HEIGHT])
             .with_resizable(false),
+        // glow (обычный OpenGL) — значительно легче по памяти, чем wgpu
+        // (дефолтный бэкенд eframe, который тянет за собой поддержку сразу
+        // DirectX12/Vulkan/Metal). Для такого простого интерфейса разница
+        // в потреблении ресурсов ощутимая, а возможностей glow хватает с запасом.
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
 

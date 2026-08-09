@@ -36,6 +36,10 @@ pub struct VoipApp {
     discovery_handles: Vec<JoinHandle<()>>,
 
     last_cleanup: Instant,
+    /// Когда в последний раз перечисляли устройства ввода/вывода —
+    /// список обновляется периодически, чтобы подключённые "на лету"
+    /// микрофон/наушники появлялись без перезапуска программы.
+    last_device_refresh: Instant,
 
     /// Открыта ли панель логов (передаётся в CollapsingHeader и
     /// переключается по клику на заголовок).
@@ -44,6 +48,12 @@ pub struct VoipApp {
     /// команду на resize каждый кадр, а только когда реальный размер
     /// контента изменился.
     last_window_size: egui::Vec2,
+    /// Снимок того, что реально влияет на высоту layout'а (количество
+    /// участников и открыт ли лог). Пересчитываем и меняем размер окна
+    /// ТОЛЬКО когда это снимок реально поменялся — а не на каждом кадре,
+    /// иначе постоянные resize-команды заметно мешают перетаскиванию
+    /// окна мышкой (конфликтуют с системным перемещением окна).
+    last_layout_signature: (usize, bool),
 }
 
 impl VoipApp {
@@ -68,8 +78,10 @@ impl VoipApp {
             voice: None,
             discovery_handles: Vec::new(),
             last_cleanup: Instant::now(),
+            last_device_refresh: Instant::now(),
             logs_open: false,
             last_window_size: egui::vec2(WINDOW_WIDTH, INITIAL_HEIGHT),
+            last_layout_signature: (0, false),
         }
     }
 
@@ -150,6 +162,14 @@ impl VoipApp {
 
 impl eframe::App for VoipApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Отключаем плавную анимацию сворачивания/разворачивания у виджетов
+        // (например, у CollapsingHeader с логами). Без этого измеренная
+        // высота контента меняется постепенно на протяжении ~12-15 кадров,
+        // и автоподгонка размера окна ниже честно следует за каждым
+        // промежуточным значением — окно "доезжает" до цели желеобразными
+        // рывками вместо одного мгновенного прыжка.
+        ctx.style_mut(|style| style.animation_time = 0.0);
+
         // Периодически чистим "отвалившихся" участников. Экран перерисовываем
         // регулярно сами — иначе изменения из фоновых потоков (новые пиры,
         // строки в логах) не появятся на экране без действий пользователя.
@@ -157,7 +177,18 @@ impl eframe::App for VoipApp {
             network::cleanup_stale_peers(&self.state, Duration::from_secs(settings::PEER_TIMEOUT_SECS));
             self.last_cleanup = Instant::now();
         }
+
+        // Периодически обновляем список устройств — чтобы подключённые
+        // "на лету" микрофон/наушники появились в выпадающем списке
+        // без перезапуска программы.
+        if self.last_device_refresh.elapsed() > Duration::from_secs(2) {
+            self.input_devices = audio::list_input_devices();
+            self.output_devices = audio::list_output_devices();
+            self.last_device_refresh = Instant::now();
+        }
         ctx.request_repaint_after(Duration::from_millis(200));
+
+        let mut peer_count = 0usize;
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical()
@@ -182,6 +213,7 @@ impl eframe::App for VoipApp {
                 v.sort_by(|a, b| a.1.cmp(&b.1));
                 v
             };
+            peer_count = peers.len();
 
             ui.scope(|ui| {
                 ui.set_min_height(PEERS_SECTION_MIN_HEIGHT);
@@ -348,15 +380,22 @@ impl eframe::App for VoipApp {
         });
 
         // Автоподгонка размера окна под реальный размер содержимого —
-        // вместо того чтобы гадать высоту в пикселях вручную. Меняем размер,
-        // только когда он реально изменился (иначе слали бы команду на
-        // resize каждый кадр), и ограничиваем сверху MAX_WINDOW_HEIGHT —
-        // дальше в дело вступает прокрутка из ScrollArea выше.
-        let used = ctx.used_size();
-        let target = egui::vec2(WINDOW_WIDTH, used.y.min(MAX_WINDOW_HEIGHT).max(MIN_WINDOW_HEIGHT));
-        if (target - self.last_window_size).length() > 1.0 {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target));
-            self.last_window_size = target;
+        // но НЕ на каждом кадре. Раньше мы сравнивали used_size() каждый
+        // кадр, и малейшее дрожание в доли пикселя (шрифты, скролл) снова
+        // и снова слало команду на resize — а если в этот момент окно
+        // ещё и перетаскивали мышкой, resize-команда конфликтовала с
+        // системным перемещением окна, отсюда и лаг/желе при переносе.
+        // Теперь пересчитываем размер только когда реально поменялось
+        // что-то, что влияет на высоту (число участников, открыт ли лог).
+        let signature = (peer_count, self.logs_open);
+        if signature != self.last_layout_signature {
+            self.last_layout_signature = signature;
+            let used = ctx.used_size();
+            let target = egui::vec2(WINDOW_WIDTH, used.y.min(MAX_WINDOW_HEIGHT).max(MIN_WINDOW_HEIGHT));
+            if (target - self.last_window_size).length() > 1.0 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target));
+                self.last_window_size = target;
+            }
         }
     }
 
