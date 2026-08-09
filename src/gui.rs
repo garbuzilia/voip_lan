@@ -5,6 +5,11 @@ use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+pub const WINDOW_WIDTH: f32 = 380.0;
+pub const BASE_HEIGHT: f32 = 300.0;
+const LOG_PANEL_HEIGHT: f32 = 200.0;
+const EXPANDED_HEIGHT: f32 = BASE_HEIGHT + LOG_PANEL_HEIGHT;
+
 pub struct VoipApp {
     state: SharedState,
     username: String,
@@ -19,6 +24,12 @@ pub struct VoipApp {
     discovery_handles: Vec<JoinHandle<()>>,
 
     last_cleanup: Instant,
+
+    /// Открыта ли панель логов — используется, чтобы окно программы
+    /// увеличивалось по высоте при её раскрытии и уменьшалось обратно
+    /// при сворачивании.
+    logs_open: bool,
+    logs_open_applied: bool,
 }
 
 impl VoipApp {
@@ -43,6 +54,8 @@ impl VoipApp {
             voice: None,
             discovery_handles: Vec::new(),
             last_cleanup: Instant::now(),
+            logs_open: false,
+            logs_open_applied: false,
         }
     }
 
@@ -132,6 +145,14 @@ impl eframe::App for VoipApp {
         }
         ctx.request_repaint_after(Duration::from_millis(200));
 
+        // Окно чуть выше при развёрнутых логах, чуть ниже — без них.
+        // Меняем размер только когда состояние реально поменялось.
+        if self.logs_open != self.logs_open_applied {
+            let target_h = if self.logs_open { EXPANDED_HEIGHT } else { BASE_HEIGHT };
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(WINDOW_WIDTH, target_h)));
+            self.logs_open_applied = self.logs_open;
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(8.0);
 
@@ -169,31 +190,50 @@ impl eframe::App for VoipApp {
 
             ui.add_space(10.0);
 
-            // --- Мьют микрофона + громкость + мьют звука — всё в одну строку ---
+            // --- Мьют микрофона / звука — обычные подписанные кнопки в одну строку ---
+            let full_width = ui.available_width();
+            let half_width = (full_width - 8.0) / 2.0;
             ui.horizontal(|ui| {
                 let mic_muted = self.state.mic_muted.load(Ordering::Relaxed);
-                if mic_icon_button(ui, mic_muted).clicked() {
+                let mic_color = if mic_muted {
+                    egui::Color32::from_rgb(150, 40, 40)
+                } else {
+                    egui::Color32::from_rgb(76, 175, 80)
+                };
+                if ui
+                    .add_sized([half_width, 34.0], egui::Button::new("Микрофон").fill(mic_color))
+                    .clicked()
+                {
                     self.state.mic_muted.store(!mic_muted, Ordering::Relaxed);
                 }
 
                 let sound_muted = self.state.sound_muted.load(Ordering::Relaxed);
-                let slider_width = ui.available_width() - 40.0 - 8.0; // минус кнопка звука и отступ
+                let sound_color = if sound_muted {
+                    egui::Color32::from_rgb(150, 40, 40)
+                } else {
+                    egui::Color32::from_rgb(76, 175, 80)
+                };
+                if ui
+                    .add_sized([half_width, 34.0], egui::Button::new("Звук").fill(sound_color))
+                    .clicked()
+                {
+                    self.state.sound_muted.store(!sound_muted, Ordering::Relaxed);
+                }
+            });
 
+            ui.add_space(10.0);
+
+            // --- Громкость микрофона: подписанный слайдер на всю ширину ---
+            ui.label("Громкость микрофона");
+            {
                 let mut gain = *self.state.mic_gain.lock().unwrap();
                 if ui
-                    .add_sized(
-                        [slider_width.max(40.0), 32.0],
-                        egui::Slider::new(&mut gain, 0.0..=2.0),
-                    )
+                    .add_sized([full_width, 20.0], egui::Slider::new(&mut gain, 0.0..=2.0))
                     .changed()
                 {
                     *self.state.mic_gain.lock().unwrap() = gain;
                 }
-
-                if sound_icon_button(ui, sound_muted).clicked() {
-                    self.state.sound_muted.store(!sound_muted, Ordering::Relaxed);
-                }
-            });
+            }
 
             ui.add_space(10.0);
 
@@ -260,10 +300,11 @@ impl eframe::App for VoipApp {
 
             ui.add_space(10.0);
 
-            // --- Логи: свёрнуты по умолчанию, разворачиваются по клику ---
+            // --- Логи: свёрнуты по умолчанию; при разворачивании окно
+            //     программы увеличивается по высоте (см. update()) ---
             let full_width = ui.available_width();
-            egui::CollapsingHeader::new("Логи")
-                .default_open(false)
+            let header_response = egui::CollapsingHeader::new("Логи")
+                .open(Some(self.logs_open))
                 .show(ui, |ui| {
                     ui.set_min_width(full_width);
                     egui::Frame::none()
@@ -273,10 +314,10 @@ impl eframe::App for VoipApp {
                             ui.set_min_width(full_width - 12.0);
                             egui::ScrollArea::vertical()
                                 .stick_to_bottom(true)
-                                .max_height(160.0)
+                                .max_height(LOG_PANEL_HEIGHT - 40.0)
                                 .show(ui, |ui| {
                                     ui.set_min_width(full_width - 24.0);
-                                    ui.set_min_height(140.0);
+                                    ui.set_min_height(LOG_PANEL_HEIGHT - 60.0);
                                     let logs = self.state.logs.lock().unwrap();
                                     if logs.is_empty() {
                                         ui.weak("Пока пусто");
@@ -288,6 +329,9 @@ impl eframe::App for VoipApp {
                                 });
                         });
                 });
+            if header_response.header_response.clicked() {
+                self.logs_open = !self.logs_open;
+            }
         });
     }
 
@@ -310,96 +354,3 @@ fn truncate_label(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Кнопка-иконка микрофона. Используются только простые, надёжно
-/// поддерживаемые примитивы (прямоугольники, линии) — без самодельных
-/// многоугольников, чтобы не ловить проблемы с порядком точек/заливкой.
-/// Цвет фона показывает состояние: зелёный — включён, красный — замьючен
-/// (плюс диагональная черта поверх иконки для дополнительной ясности).
-fn mic_icon_button(ui: &mut egui::Ui, muted: bool) -> egui::Response {
-    let size = egui::vec2(40.0, 32.0);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-
-    if ui.is_rect_visible(rect) {
-        let bg = if muted {
-            egui::Color32::from_rgb(150, 40, 40)
-        } else {
-            egui::Color32::from_rgb(76, 175, 80)
-        };
-        let painter = ui.painter();
-        painter.rect_filled(rect, egui::Rounding::same(6.0), bg);
-
-        let icon_color = egui::Color32::WHITE;
-        let c = rect.center() - egui::vec2(0.0, 3.0);
-
-        // Головка микрофона — капсула (закруглённый прямоугольник)
-        let head_w = 10.0;
-        let head_h = 14.0;
-        let head_rect = egui::Rect::from_center_size(c, egui::vec2(head_w, head_h));
-        painter.rect_filled(head_rect, egui::Rounding::same(head_w / 2.0), icon_color);
-
-        // Две тонкие полоски-"решётка", чтобы форма явно читалась как микрофон
-        painter.line_segment(
-            [head_rect.left_center() + egui::vec2(0.0, -2.0), head_rect.right_center() + egui::vec2(0.0, -2.0)],
-            egui::Stroke::new(1.0, bg),
-        );
-        painter.line_segment(
-            [head_rect.left_center() + egui::vec2(0.0, 2.0), head_rect.right_center() + egui::vec2(0.0, 2.0)],
-            egui::Stroke::new(1.0, bg),
-        );
-
-        // Стойка и основание под микрофоном
-        let stand_bottom = head_rect.center_bottom() + egui::vec2(0.0, 8.0);
-        painter.line_segment([head_rect.center_bottom(), stand_bottom], egui::Stroke::new(2.0, icon_color));
-        painter.line_segment(
-            [stand_bottom - egui::vec2(5.0, 0.0), stand_bottom + egui::vec2(5.0, 0.0)],
-            egui::Stroke::new(2.0, icon_color),
-        );
-
-        if muted {
-            painter.line_segment(
-                [rect.left_top() + egui::vec2(5.0, 5.0), rect.right_bottom() - egui::vec2(5.0, 5.0)],
-                egui::Stroke::new(2.5, icon_color),
-            );
-        }
-    }
-
-    response.on_hover_text(if muted { "Микрофон выключен (нажмите, чтобы включить)" } else { "Микрофон включён (нажмите, чтобы выключить)" })
-}
-
-/// Кнопка-иконка динамика (весь входящий звук). Корпус — прямоугольник,
-/// раструб — круг сбоку (вместо треугольника-полигона, который отрисовался
-/// некорректно). Такое сочетание тоже читается как "динамик/громкость",
-/// но использует только простые примитивы.
-fn sound_icon_button(ui: &mut egui::Ui, muted: bool) -> egui::Response {
-    let size = egui::vec2(40.0, 32.0);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-
-    if ui.is_rect_visible(rect) {
-        let bg = if muted {
-            egui::Color32::from_rgb(150, 40, 40)
-        } else {
-            egui::Color32::from_rgb(76, 175, 80)
-        };
-        let painter = ui.painter();
-        painter.rect_filled(rect, egui::Rounding::same(6.0), bg);
-
-        let icon_color = egui::Color32::WHITE;
-        let c = rect.center();
-
-        // Корпус динамика
-        let box_rect = egui::Rect::from_center_size(c - egui::vec2(5.0, 0.0), egui::vec2(7.0, 12.0));
-        painter.rect_filled(box_rect, egui::Rounding::same(1.5), icon_color);
-
-        // Раструб — круг, слегка перекрывающий корпус справа
-        painter.circle_filled(box_rect.right_center() + egui::vec2(4.0, 0.0), 7.0, icon_color);
-
-        if muted {
-            painter.line_segment(
-                [rect.left_top() + egui::vec2(5.0, 5.0), rect.right_bottom() - egui::vec2(5.0, 5.0)],
-                egui::Stroke::new(2.5, icon_color),
-            );
-        }
-    }
-
-    response.on_hover_text(if muted { "Звук выключен (нажмите, чтобы включить)" } else { "Звук включён (нажмите, чтобы выключить)" })
-}
