@@ -9,7 +9,10 @@ pub const WINDOW_WIDTH: f32 = 380.0;
 /// Стартовая высота окна — не обязана быть точной: сразу после первого
 /// кадра окно само подгонится под реальный размер содержимого (см. update()),
 /// поэтому не нужно вручную высчитывать пиксели под каждый элемент.
-pub const INITIAL_HEIGHT: f32 = 340.0;
+pub const INITIAL_HEIGHT: f32 = 460.0;
+/// Нижний предел высоты окна: не даём окну сжаться до почти квадратных
+/// пропорций даже когда контента совсем мало (пустой список участников).
+const MIN_WINDOW_HEIGHT: f32 = 460.0;
 /// Верхний предел высоты окна (на случай очень длинного списка участников
 /// или большого количества логов) — дальше начинает работать прокрутка,
 /// а не бесконечный рост окна.
@@ -192,7 +195,9 @@ impl eframe::App for VoipApp {
                 }
             }
 
-            ui.add_space(10.0);
+            ui.add_space(14.0);
+            ui.separator();
+            ui.add_space(14.0);
 
             // --- Мьют микрофона / звука — обычные подписанные кнопки в одну строку ---
             let full_width = ui.available_width();
@@ -343,7 +348,7 @@ impl eframe::App for VoipApp {
         // resize каждый кадр), и ограничиваем сверху MAX_WINDOW_HEIGHT —
         // дальше в дело вступает прокрутка из ScrollArea выше.
         let used = ctx.used_size();
-        let target = egui::vec2(WINDOW_WIDTH, used.y.min(MAX_WINDOW_HEIGHT).max(120.0));
+        let target = egui::vec2(WINDOW_WIDTH, used.y.min(MAX_WINDOW_HEIGHT).max(MIN_WINDOW_HEIGHT));
         if (target - self.last_window_size).length() > 1.0 {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target));
             self.last_window_size = target;
