@@ -6,9 +6,14 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub const WINDOW_WIDTH: f32 = 380.0;
-pub const BASE_HEIGHT: f32 = 300.0;
-const LOG_PANEL_HEIGHT: f32 = 200.0;
-const EXPANDED_HEIGHT: f32 = BASE_HEIGHT + LOG_PANEL_HEIGHT;
+/// Стартовая высота окна — не обязана быть точной: сразу после первого
+/// кадра окно само подгонится под реальный размер содержимого (см. update()),
+/// поэтому не нужно вручную высчитывать пиксели под каждый элемент.
+pub const INITIAL_HEIGHT: f32 = 340.0;
+/// Верхний предел высоты окна (на случай очень длинного списка участников
+/// или большого количества логов) — дальше начинает работать прокрутка,
+/// а не бесконечный рост окна.
+const MAX_WINDOW_HEIGHT: f32 = 700.0;
 
 pub struct VoipApp {
     state: SharedState,
@@ -25,11 +30,13 @@ pub struct VoipApp {
 
     last_cleanup: Instant,
 
-    /// Открыта ли панель логов — используется, чтобы окно программы
-    /// увеличивалось по высоте при её раскрытии и уменьшалось обратно
-    /// при сворачивании.
+    /// Открыта ли панель логов (передаётся в CollapsingHeader и
+    /// переключается по клику на заголовок).
     logs_open: bool,
-    logs_open_applied: bool,
+    /// Последний размер окна, который мы сами применили — чтобы не слать
+    /// команду на resize каждый кадр, а только когда реальный размер
+    /// контента изменился.
+    last_window_size: egui::Vec2,
 }
 
 impl VoipApp {
@@ -55,7 +62,7 @@ impl VoipApp {
             discovery_handles: Vec::new(),
             last_cleanup: Instant::now(),
             logs_open: false,
-            logs_open_applied: false,
+            last_window_size: egui::vec2(WINDOW_WIDTH, INITIAL_HEIGHT),
         }
     }
 
@@ -145,15 +152,10 @@ impl eframe::App for VoipApp {
         }
         ctx.request_repaint_after(Duration::from_millis(200));
 
-        // Окно чуть выше при развёрнутых логах, чуть ниже — без них.
-        // Меняем размер только когда состояние реально поменялось.
-        if self.logs_open != self.logs_open_applied {
-            let target_h = if self.logs_open { EXPANDED_HEIGHT } else { BASE_HEIGHT };
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(WINDOW_WIDTH, target_h)));
-            self.logs_open_applied = self.logs_open;
-        }
-
         egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(MAX_WINDOW_HEIGHT)
+                .show(ui, |ui| {
             ui.add_space(8.0);
 
             // --- Имя пользователя ---
@@ -181,7 +183,11 @@ impl eframe::App for VoipApp {
                     let mut gain = self.state.peer_gain(addr);
                     ui.horizontal(|ui| {
                         ui.label(name);
-                        if ui.add(egui::Slider::new(&mut gain, 0.0..=2.0)).changed() {
+                        let remaining = (ui.available_width() - 55.0).max(40.0);
+                        if ui
+                            .add(egui::Slider::new(&mut gain, 0.0..=2.0).desired_width(remaining))
+                            .changed()
+                        {
                             self.state.set_peer_gain(*addr, gain);
                         }
                     });
@@ -228,7 +234,7 @@ impl eframe::App for VoipApp {
             {
                 let mut gain = *self.state.mic_gain.lock().unwrap();
                 if ui
-                    .add_sized([full_width, 20.0], egui::Slider::new(&mut gain, 0.0..=2.0))
+                    .add(egui::Slider::new(&mut gain, 0.0..=2.0).desired_width(full_width - 55.0))
                     .changed()
                 {
                     *self.state.mic_gain.lock().unwrap() = gain;
@@ -314,10 +320,10 @@ impl eframe::App for VoipApp {
                             ui.set_min_width(full_width - 12.0);
                             egui::ScrollArea::vertical()
                                 .stick_to_bottom(true)
-                                .max_height(LOG_PANEL_HEIGHT - 40.0)
+                                .max_height(180.0)
                                 .show(ui, |ui| {
                                     ui.set_min_width(full_width - 24.0);
-                                    ui.set_min_height(LOG_PANEL_HEIGHT - 60.0);
+                                    ui.set_min_height(160.0);
                                     let logs = self.state.logs.lock().unwrap();
                                     if logs.is_empty() {
                                         ui.weak("Пока пусто");
@@ -332,7 +338,20 @@ impl eframe::App for VoipApp {
             if header_response.header_response.clicked() {
                 self.logs_open = !self.logs_open;
             }
+            }); // конец ScrollArea
         });
+
+        // Автоподгонка размера окна под реальный размер содержимого —
+        // вместо того чтобы гадать высоту в пикселях вручную. Меняем размер,
+        // только когда он реально изменился (иначе слали бы команду на
+        // resize каждый кадр), и ограничиваем сверху MAX_WINDOW_HEIGHT —
+        // дальше в дело вступает прокрутка из ScrollArea выше.
+        let used = ctx.used_size();
+        let target = egui::vec2(WINDOW_WIDTH, used.y.min(MAX_WINDOW_HEIGHT).max(120.0));
+        if (target - self.last_window_size).length() > 1.0 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target));
+            self.last_window_size = target;
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
