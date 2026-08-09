@@ -17,6 +17,10 @@ const MIN_WINDOW_HEIGHT: f32 = 460.0;
 /// или большого количества логов) — дальше начинает работать прокрутка,
 /// а не бесконечный рост окна.
 const MAX_WINDOW_HEIGHT: f32 = 700.0;
+/// Зарезервированная минимальная высота под блок участников — так
+/// настройки ниже всегда начинаются на одной и той же высоте, даже
+/// когда участников мало или нет совсем (тогда просто пустое место).
+const PEERS_SECTION_MIN_HEIGHT: f32 = 110.0;
 
 pub struct VoipApp {
     state: SharedState,
@@ -179,25 +183,26 @@ impl eframe::App for VoipApp {
                 v
             };
 
-            if peers.is_empty() {
-                ui.weak("Участников пока нет");
-            } else {
-                for (addr, name) in &peers {
-                    let mut gain = self.state.peer_gain(addr);
-                    ui.horizontal(|ui| {
-                        ui.label(name);
-                        let remaining = (ui.available_width() - 55.0).max(40.0);
-                        ui.spacing_mut().slider_width = remaining;
-                        if ui.add(egui::Slider::new(&mut gain, 0.0..=2.0)).changed() {
-                            self.state.set_peer_gain(*addr, gain);
-                        }
-                    });
+            ui.scope(|ui| {
+                ui.set_min_height(PEERS_SECTION_MIN_HEIGHT);
+                if peers.is_empty() {
+                    ui.weak("Участников пока нет");
+                } else {
+                    for (addr, name) in &peers {
+                        let mut gain = self.state.peer_gain(addr);
+                        ui.horizontal(|ui| {
+                            ui.label(name);
+                            let remaining = (ui.available_width() - 55.0).max(40.0);
+                            ui.spacing_mut().slider_width = remaining;
+                            if ui.add(egui::Slider::new(&mut gain, 0.0..=2.0)).changed() {
+                                self.state.set_peer_gain(*addr, gain);
+                            }
+                        });
+                    }
                 }
-            }
+            });
 
-            ui.add_space(14.0);
-            ui.separator();
-            ui.add_space(14.0);
+            ui.add_space(10.0);
 
             // --- Мьют микрофона / звука — обычные подписанные кнопки в одну строку ---
             let full_width = ui.available_width();
