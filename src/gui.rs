@@ -184,10 +184,8 @@ impl eframe::App for VoipApp {
                     ui.horizontal(|ui| {
                         ui.label(name);
                         let remaining = (ui.available_width() - 55.0).max(40.0);
-                        if ui
-                            .add(egui::Slider::new(&mut gain, 0.0..=2.0).desired_width(remaining))
-                            .changed()
-                        {
+                        ui.spacing_mut().slider_width = remaining;
+                        if ui.add(egui::Slider::new(&mut gain, 0.0..=2.0)).changed() {
                             self.state.set_peer_gain(*addr, gain);
                         }
                     });
@@ -233,10 +231,8 @@ impl eframe::App for VoipApp {
             ui.label("Громкость микрофона");
             {
                 let mut gain = *self.state.mic_gain.lock().unwrap();
-                if ui
-                    .add(egui::Slider::new(&mut gain, 0.0..=2.0).desired_width(full_width - 55.0))
-                    .changed()
-                {
+                ui.spacing_mut().slider_width = full_width - 55.0;
+                if ui.add(egui::Slider::new(&mut gain, 0.0..=2.0)).changed() {
                     *self.state.mic_gain.lock().unwrap() = gain;
                 }
             }
